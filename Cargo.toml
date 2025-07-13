@@ -1,0 +1,11 @@
+[package]
+name = "now-playing"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+itertools = "0.14.0"
+tokio = { version = "1.46.1", features = ["full"] }
+windows = { version = "0.61.3", features = ["Data_Xml_Dom", "Media_Control", "UI_Notifications", "Win32"] }
+windows-future = "0.2.1"
+windows-result = "0.3.4"
