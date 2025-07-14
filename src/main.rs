@@ -4,7 +4,7 @@ use std::{io::ErrorKind, time::Duration};
 use windows::{
     Data::Xml::Dom::{XmlDocument, XmlElement},
     Foundation::TypedEventHandler,
-    Media::Control::GlobalSystemMediaTransportControlsSessionManager,
+    Media::Control::{GlobalSystemMediaTransportControlsSession, GlobalSystemMediaTransportControlsSessionManager},
     UI::Notifications::{ToastNotification, ToastNotificationManager, ToastTemplateType},
     core::Interface,
 };
@@ -82,6 +82,42 @@ struct SessionInfo {
     album_title: String,
 }
 
+async fn get_session_info(global_system_media_transport_controls_session: &GlobalSystemMediaTransportControlsSession) -> anyhow::Result<SessionInfo> {
+    let source_app_user_mode_id = global_system_media_transport_controls_session
+        .SourceAppUserModelId()
+        .context("Can not get source app user model id")?
+        .to_string_lossy();
+    tokio::time::sleep(Duration::new(2, 0)).await;
+    let global_system_media_transport_controls_session_media_properties = global_system_media_transport_controls_session
+        .TryGetMediaPropertiesAsync()
+        .context("Can not get media properties")?
+        .await
+        .context("Can not get media properties")?;
+    let title = global_system_media_transport_controls_session_media_properties
+        .Title()
+        .context("Can not get title")?
+        .to_string_lossy();
+    let subtitle = global_system_media_transport_controls_session_media_properties
+        .Subtitle()
+        .context("Can not get subtitle")?
+        .to_string_lossy();
+    let artist = global_system_media_transport_controls_session_media_properties
+        .Artist()
+        .context("Can not get artist")?
+        .to_string_lossy();
+    let album_title = global_system_media_transport_controls_session_media_properties
+        .AlbumTitle()
+        .context("Can not get album title")?
+        .to_string_lossy();
+    Ok(SessionInfo {
+        source_app_user_mode_id,
+        title,
+        subtitle,
+        artist,
+        album_title,
+    })
+}
+
 async fn get_session_infos() -> anyhow::Result<Vec<SessionInfo>> {
     let mut session_infos = vec![];
     let global_system_media_transport_controls_session_manager = GlobalSystemMediaTransportControlsSessionManager::RequestAsync()
@@ -92,39 +128,18 @@ async fn get_session_infos() -> anyhow::Result<Vec<SessionInfo>> {
         .GetSessions()
         .context("Can not get sessions")?
     {
-        let source_app_user_mode_id = global_system_media_transport_controls_session
-            .SourceAppUserModelId()
-            .context("Can not get source app user model id")?
-            .to_string_lossy();
-        tokio::time::sleep(Duration::new(2, 0)).await;
-        let global_system_media_transport_controls_session_media_properties = global_system_media_transport_controls_session
-            .TryGetMediaPropertiesAsync()
-            .context("Can not get media properties")?
-            .await
-            .context("Can not get media properties")?;
-        let title = global_system_media_transport_controls_session_media_properties
-            .Title()
-            .context("Can not get title")?
-            .to_string_lossy();
-        let subtitle = global_system_media_transport_controls_session_media_properties
-            .Subtitle()
-            .context("Can not get subtitle")?
-            .to_string_lossy();
-        let artist = global_system_media_transport_controls_session_media_properties
-            .Artist()
-            .context("Can not get artist")?
-            .to_string_lossy();
-        let album_title = global_system_media_transport_controls_session_media_properties
-            .AlbumTitle()
-            .context("Can not get album title")?
-            .to_string_lossy();
-        session_infos.push(SessionInfo {
-            source_app_user_mode_id,
-            title,
-            subtitle,
-            artist,
-            album_title,
-        });
+        for _ in 0..20 {
+            let session_info_result = get_session_info(&global_system_media_transport_controls_session).await;
+            match session_info_result {
+                Ok(session_info) => {
+                    session_infos.push(session_info);
+                    break;
+                }
+                Err(_) => {
+                    tokio::time::sleep(Duration::new(0, 50_000_000)).await;
+                }
+            }
+        }
     }
     Ok(session_infos)
 }
@@ -156,7 +171,7 @@ async fn run_notifer() -> anyhow::Result<()> {
             }
             let full_title = format!("{} – {}", &session_info.title, &session_info.subtitle);
             send_toast(
-                Duration::new(5, 0),
+                Duration::new(4, 0),
                 &session_info.source_app_user_mode_id,
                 if session_info.subtitle.is_empty() { &session_info.title } else { &full_title },
                 &session_info.album_title,
