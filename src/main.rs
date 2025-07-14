@@ -1,16 +1,79 @@
-use anyhow::{Context, anyhow};
+use anyhow::{Context, anyhow, bail};
 use itertools::Itertools;
-use std::{io::ErrorKind, time::Duration};
+use std::{
+    io::{ErrorKind, Write},
+    path::PathBuf,
+    time::Duration,
+};
 use windows::{
     Data::Xml::Dom::{XmlDocument, XmlElement},
     Foundation::TypedEventHandler,
-    Media::Control::{GlobalSystemMediaTransportControlsSession, GlobalSystemMediaTransportControlsSessionManager},
+    Graphics::Imaging::BitmapDecoder,
+    Media::Control::{
+        GlobalSystemMediaTransportControlsSession, GlobalSystemMediaTransportControlsSessionManager, GlobalSystemMediaTransportControlsSessionMediaProperties,
+    },
+    Storage::Streams::{Buffer, IBuffer, InputStreamOptions},
     UI::Notifications::{ToastNotification, ToastNotificationManager, ToastTemplateType},
+    Win32::System::WinRT::IBufferByteAccess,
     core::Interface,
 };
 
-async fn send_toast(duration: Duration, source_app_user_mode_id: &str, line_1: &str, line_2: &str, line_3: &str) -> anyhow::Result<()> {
-    let toast_template = ToastNotificationManager::GetTemplateContent(ToastTemplateType::ToastImageAndText04).context("Can not get template content")?;
+fn create_temp_file_with_extension_and_contents(extension: &str, contents: &[u8]) -> anyhow::Result<PathBuf> {
+    let named_temp_file = tempfile::Builder::new()
+        .disable_cleanup(true)
+        .prefix("thumbnail_")
+        .suffix(extension)
+        .tempfile()?;
+    let path = named_temp_file.path().to_path_buf();
+    let mut file = named_temp_file.into_file();
+    file.write_all(contents)?;
+    Ok(path)
+}
+
+fn i_buffer_info_bytes(buffer: &IBuffer) -> anyhow::Result<&[u8]> {
+    let i_buffer_byte_access = buffer.cast::<IBufferByteAccess>()?;
+    unsafe {
+        let data = i_buffer_byte_access.Buffer()?;
+        Ok(std::slice::from_raw_parts_mut(data, buffer.Length()? as usize))
+    }
+}
+
+fn mime_type_to_extension(mime_type: &str) -> anyhow::Result<String> {
+    for bitmap_codec_information in BitmapDecoder::GetDecoderInformationEnumerator()? {
+        for codec_mime_type in bitmap_codec_information.MimeTypes()? {
+            if codec_mime_type.to_os_string() == mime_type {
+                return Ok(bitmap_codec_information
+                    .FileExtensions()?
+                    .into_iter()
+                    .next()
+                    .ok_or(anyhow!("Mime type found, but has no extensions"))?
+                    .to_string_lossy());
+            }
+        }
+    }
+    bail!("No extension found")
+}
+
+#[derive(PartialEq, Eq, Debug)]
+struct Thumbnail {
+    mime_type: String,
+    bytes: Box<[u8]>,
+}
+
+async fn send_toast(
+    duration: Duration,
+    source_app_user_mode_id: &str,
+    line_1: &str,
+    line_2: &str,
+    line_3: &str,
+    thumbnail: &Option<Thumbnail>,
+) -> anyhow::Result<()> {
+    let toast_template = ToastNotificationManager::GetTemplateContent(if thumbnail.is_some() {
+        ToastTemplateType::ToastImageAndText04
+    } else {
+        ToastTemplateType::ToastText04
+    })
+    .context("Can not get template content")?;
     let toast_element = toast_template
         .GetElementsByTagName(&"toast".into())
         .context("Can not find element <toast>")?
@@ -42,22 +105,27 @@ async fn send_toast(duration: Duration, source_app_user_mode_id: &str, line_1: &
                 .context("Can not append child")?;
         }
     }
-    for image_node in toast_element
-        .GetElementsByTagName(&"image".into())
-        .context("Can not find elements <image>")?
-        .into_iter()
-        .collect::<Vec<_>>()
+    if let Some(thumbnail) = thumbnail
+        && let Ok(extension) = mime_type_to_extension(&thumbnail.mime_type)
     {
-        let image_element = image_node.cast::<XmlElement>().context("Node <image> is not an element")?;
-        if image_element
-            .GetAttribute(&"id".into())
-            .context("Can not get attribute `id`")?
-            .to_string_lossy()
-            == "1"
+        let path = create_temp_file_with_extension_and_contents(&extension, &thumbnail.bytes).context("Can not create temporary file")?;
+        for image_node in toast_element
+            .GetElementsByTagName(&"image".into())
+            .context("Can not find elements <image>")?
+            .into_iter()
+            .collect::<Vec<_>>()
         {
-            image_element
-                .SetAttribute(&"src".into(), &"file:///C:/Users/artfd/Pictures/Unpacking/20250711_0001.png".into())
-                .context("Can not set attribute `id`")?;
+            let image_element = image_node.cast::<XmlElement>().context("Node <image> is not an element")?;
+            if image_element
+                .GetAttribute(&"id".into())
+                .context("Can not get attribute `id`")?
+                .to_string_lossy()
+                == "1"
+            {
+                image_element
+                    .SetAttribute(&"src".into(), &format!("file:///{}", path.as_os_str().to_string_lossy()).into())
+                    .context("Can not set attribute `id`")?;
+            }
         }
     }
     let audio_element = toast_template.CreateElement(&"audio".into()).context("Can not create element <audio>")?;
@@ -80,6 +148,21 @@ struct SessionInfo {
     subtitle: String,
     artist: String,
     album_title: String,
+    thumbnail: Option<Thumbnail>,
+}
+async fn get_thumbnail(
+    global_system_media_transport_controls_session_media_properties: &GlobalSystemMediaTransportControlsSessionMediaProperties,
+) -> anyhow::Result<Thumbnail> {
+    let i_random_access_stream_with_content_type = global_system_media_transport_controls_session_media_properties
+        .Thumbnail()?
+        .OpenReadAsync()?
+        .await?;
+    let mime_type = i_random_access_stream_with_content_type.ContentType()?.to_string_lossy();
+    let buffer = Buffer::Create(i_random_access_stream_with_content_type.Size()? as _)?;
+    i_random_access_stream_with_content_type.ReadAsync(&buffer, i_random_access_stream_with_content_type.Size()? as _, InputStreamOptions::None)?;
+    let i_buffer = buffer.into();
+    let bytes = i_buffer_info_bytes(&i_buffer)?.to_vec().into_boxed_slice();
+    Ok(Thumbnail { mime_type, bytes })
 }
 
 async fn get_session_info(global_system_media_transport_controls_session: &GlobalSystemMediaTransportControlsSession) -> anyhow::Result<SessionInfo> {
@@ -109,12 +192,14 @@ async fn get_session_info(global_system_media_transport_controls_session: &Globa
         .AlbumTitle()
         .context("Can not get album title")?
         .to_string_lossy();
+    let thumbnail = get_thumbnail(&global_system_media_transport_controls_session_media_properties).await.ok();
     Ok(SessionInfo {
         source_app_user_mode_id,
         title,
         subtitle,
         artist,
         album_title,
+        thumbnail,
     })
 }
 
@@ -176,6 +261,7 @@ async fn run_notifer() -> anyhow::Result<()> {
                 if session_info.subtitle.is_empty() { &session_info.title } else { &full_title },
                 &session_info.album_title,
                 &session_info.artist,
+                &session_info.thumbnail,
             )
             .await
             .context("Failed to send toast")?;
