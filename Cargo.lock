@@ -146,6 +146,7 @@ dependencies = [
  "windows",
  "windows-future",
  "windows-result",
+ "windows-strings",
 ]
 
 [[package]]
