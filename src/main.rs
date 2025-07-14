@@ -73,7 +73,7 @@ async fn send_toast(duration: Duration, source_app_user_mode_id: &str, line_1: &
     Ok(())
 }
 
-#[derive(Debug)]
+#[derive(PartialEq, Eq, Debug)]
 struct SessionInfo {
     source_app_user_mode_id: String,
     title: String,
@@ -82,7 +82,7 @@ struct SessionInfo {
     album_title: String,
 }
 
-async fn sessions_changed() -> anyhow::Result<Vec<SessionInfo>> {
+async fn get_session_infos() -> anyhow::Result<Vec<SessionInfo>> {
     let mut session_infos = vec![];
     let global_system_media_transport_controls_session_manager = GlobalSystemMediaTransportControlsSessionManager::RequestAsync()
         .context("Can not get global system media transport controls session manager")?
@@ -144,26 +144,28 @@ async fn run_notifer() -> anyhow::Result<()> {
         }
     }))?;
     tx.send(())?;
+    let mut prev_session_infos = vec![];
     while let Some(()) = rx.recv().await {
-        let session_infos = sessions_changed().await.context("Can not get session infos")?;
-        for session_info in session_infos {
+        let session_infos = get_session_infos().await.context("Can not get session infos")?;
+        for session_info in &session_infos {
+            if prev_session_infos.contains(session_info) {
+                continue;
+            }
             if session_info.source_app_user_mode_id.starts_with("MSTeams_") {
                 continue;
             }
+            let full_title = format!("{} – {}", &session_info.title, &session_info.subtitle);
             send_toast(
                 Duration::new(5, 0),
                 &session_info.source_app_user_mode_id,
-                &(if session_info.subtitle.is_empty() {
-                    session_info.title
-                } else {
-                    format!("{} – {}", session_info.title, session_info.subtitle)
-                }),
+                if session_info.subtitle.is_empty() { &session_info.title } else { &full_title },
                 &session_info.album_title,
                 &session_info.artist,
             )
             .await
             .context("Failed to send toast")?;
         }
+        prev_session_infos = session_infos;
     }
     Ok(())
 }
