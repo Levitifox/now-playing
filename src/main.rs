@@ -9,7 +9,7 @@ use windows::{
     core::{HRESULT, Interface},
 };
 
-async fn send_toast(duration: Duration, line_1: &str, line_2: &str, line_3: &str) -> windows::core::Result<()> {
+async fn send_toast(duration: Duration, line_1: &str, line_2: &str, line_3: &str) -> anyhow::Result<()> {
     let toast_template = ToastNotificationManager::GetTemplateContent(ToastTemplateType::ToastImageAndText04)?;
     let toast_element = toast_template
         .GetElementsByTagName(&"toast".into())?
@@ -55,7 +55,7 @@ struct SessionInfo {
     album_title: String,
 }
 
-async fn sessions_changed() -> windows::core::Result<Vec<SessionInfo>> {
+async fn sessions_changed() -> anyhow::Result<Vec<SessionInfo>> {
     let mut session_infos = vec![];
     let global_system_media_transport_controls_session_manager = GlobalSystemMediaTransportControlsSessionManager::RequestAsync()?.await?;
     for global_system_media_transport_controls_session in global_system_media_transport_controls_session_manager.GetSessions()? {
@@ -77,7 +77,7 @@ async fn sessions_changed() -> windows::core::Result<Vec<SessionInfo>> {
     Ok(session_infos)
 }
 
-async fn run_notifer() -> windows::core::Result<()> {
+async fn run_notifer() -> anyhow::Result<()> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     let global_system_media_transport_controls_session_manager = GlobalSystemMediaTransportControlsSessionManager::RequestAsync()?.await?;
     global_system_media_transport_controls_session_manager.SessionsChanged(&TypedEventHandler::new({
@@ -114,7 +114,7 @@ async fn run_notifer() -> windows::core::Result<()> {
 }
 
 #[tokio::main]
-async fn main() -> windows::core::Result<()> {
+async fn main() -> anyhow::Result<()> {
     run_notifer().await?;
     Ok(())
 }
