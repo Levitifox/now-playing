@@ -1,6 +1,9 @@
 use anyhow::{Context, anyhow, bail};
+use clap::Parser;
 use itertools::Itertools;
+use serde_derive::{Deserialize, Serialize};
 use std::{
+    env, fs,
     io::{ErrorKind, Write},
     path::PathBuf,
     time::Duration,
@@ -12,30 +15,17 @@ use windows::{
     Media::Control::{
         GlobalSystemMediaTransportControlsSession, GlobalSystemMediaTransportControlsSessionManager, GlobalSystemMediaTransportControlsSessionMediaProperties,
     },
-    Storage::Streams::{Buffer, IBuffer, InputStreamOptions},
+    Storage::Streams::DataReader,
     UI::Notifications::{ToastNotification, ToastNotificationManager, ToastTemplateType},
-    Win32::System::WinRT::IBufferByteAccess,
     core::Interface,
 };
 
-fn create_temp_file_with_extension_and_contents(extension: &str, contents: &[u8]) -> anyhow::Result<PathBuf> {
-    let named_temp_file = tempfile::Builder::new()
-        .disable_cleanup(true)
-        .prefix("thumbnail_")
-        .suffix(extension)
-        .tempfile()?;
+fn create_temp_file_with_contents(prefix: &str, suffix: &str, contents: &[u8]) -> anyhow::Result<PathBuf> {
+    let named_temp_file = tempfile::Builder::new().disable_cleanup(true).prefix(prefix).suffix(suffix).tempfile()?;
     let path = named_temp_file.path().to_path_buf();
     let mut file = named_temp_file.into_file();
     file.write_all(contents)?;
     Ok(path)
-}
-
-fn i_buffer_info_bytes(buffer: &IBuffer) -> anyhow::Result<&[u8]> {
-    let i_buffer_byte_access = buffer.cast::<IBufferByteAccess>()?;
-    unsafe {
-        let data = i_buffer_byte_access.Buffer()?;
-        Ok(std::slice::from_raw_parts_mut(data, buffer.Length()? as usize))
-    }
 }
 
 fn mime_type_to_extension(mime_type: &str) -> anyhow::Result<String> {
@@ -54,21 +44,24 @@ fn mime_type_to_extension(mime_type: &str) -> anyhow::Result<String> {
     bail!("No extension found")
 }
 
-#[derive(PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Clone, Debug, Serialize, Deserialize)]
 struct Thumbnail {
     mime_type: String,
     bytes: Box<[u8]>,
 }
 
-async fn send_toast(
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Toast {
     duration: Duration,
-    source_app_user_mode_id: &str,
-    line_1: &str,
-    line_2: &str,
-    line_3: &str,
-    thumbnail: &Option<Thumbnail>,
-) -> anyhow::Result<()> {
-    let toast_template = ToastNotificationManager::GetTemplateContent(if thumbnail.is_some() {
+    source_app_user_mode_id: String,
+    line_1: String,
+    line_2: String,
+    line_3: String,
+    thumbnail: Option<Thumbnail>,
+}
+
+async fn command_send_toast(toast: Toast) -> anyhow::Result<()> {
+    let toast_template = ToastNotificationManager::GetTemplateContent(if toast.thumbnail.is_some() {
         ToastTemplateType::ToastImageAndText04
     } else {
         ToastTemplateType::ToastText04
@@ -91,24 +84,24 @@ async fn send_toast(
         let text_element = text_node.cast::<XmlElement>().context("Node <text> is not an element")?;
         if text_element.GetAttribute(&"id".into()).context("Can not get attribute `id`")?.to_string_lossy() == "1" {
             text_element
-                .AppendChild(&XmlDocument::CreateTextNode(&toast_template, &line_1.into()).context("Can not create text node")?)
+                .AppendChild(&XmlDocument::CreateTextNode(&toast_template, &toast.line_1.clone().into()).context("Can not create text node")?)
                 .context("Can not append child")?;
         }
         if text_element.GetAttribute(&"id".into()).context("Can not get attribute `id`")?.to_string_lossy() == "2" {
             text_element
-                .AppendChild(&XmlDocument::CreateTextNode(&toast_template, &line_2.into()).context("Can not create text node")?)
+                .AppendChild(&XmlDocument::CreateTextNode(&toast_template, &toast.line_2.clone().into()).context("Can not create text node")?)
                 .context("Can not append child")?;
         }
         if text_element.GetAttribute(&"id".into()).context("Can not get attribute `id`")?.to_string_lossy() == "3" {
             text_element
-                .AppendChild(&XmlDocument::CreateTextNode(&toast_template, &line_3.into()).context("Can not create text node")?)
+                .AppendChild(&XmlDocument::CreateTextNode(&toast_template, &toast.line_3.clone().into()).context("Can not create text node")?)
                 .context("Can not append child")?;
         }
     }
-    if let Some(thumbnail) = thumbnail
+    if let Some(thumbnail) = toast.thumbnail
         && let Ok(extension) = mime_type_to_extension(&thumbnail.mime_type)
     {
-        let path = create_temp_file_with_extension_and_contents(&extension, &thumbnail.bytes).context("Can not create temporary file")?;
+        let thumbnail_path = create_temp_file_with_contents("thumbnail_f", &extension, &thumbnail.bytes).context("Can not create temporary file")?;
         for image_node in toast_element
             .GetElementsByTagName(&"image".into())
             .context("Can not find elements <image>")?
@@ -123,7 +116,7 @@ async fn send_toast(
                 == "1"
             {
                 image_element
-                    .SetAttribute(&"src".into(), &format!("file:///{}", path.as_os_str().to_string_lossy()).into())
+                    .SetAttribute(&"src".into(), &format!("file:///{}", thumbnail_path.as_os_str().to_string_lossy()).into())
                     .context("Can not set attribute `id`")?;
             }
         }
@@ -133,11 +126,19 @@ async fn send_toast(
         .SetAttribute(&"silent".into(), &"true".into())
         .context("Can not set attribute `silent`")?;
     toast_element.AppendChild(&audio_element).context("Can not append child")?;
-    let toast_notifier = ToastNotificationManager::CreateToastNotifierWithId(&source_app_user_mode_id.into()).context("Can not creat toast notifier")?;
+    let toast_notifier = ToastNotificationManager::CreateToastNotifierWithId(&toast.source_app_user_mode_id.into()).context("Can not creat toast notifier")?;
     let toast_notification = ToastNotification::CreateToastNotification(&toast_template).context("Can not creat toast notification")?;
     toast_notifier.Show(&toast_notification).context("Can not show notification")?;
-    tokio::time::sleep(duration).await;
+    tokio::time::sleep(toast.duration).await;
     toast_notifier.Hide(&toast_notification).context("Can not hide notification")?;
+    Ok(())
+}
+
+async fn send_toast(toast: Toast) -> anyhow::Result<()> {
+    let toast_json = serde_json::to_string(&toast)?;
+    let toast_json_path = create_temp_file_with_contents("toast_json_", ".json", toast_json.as_bytes())?;
+    let mut child = std::process::Command::new(env::current_exe()?).arg("send-toast").arg(toast_json_path).spawn()?;
+    tokio::task::spawn_blocking(move || child.wait()).await??;
     Ok(())
 }
 
@@ -150,18 +151,22 @@ struct SessionInfo {
     album_title: String,
     thumbnail: Option<Thumbnail>,
 }
+
 async fn get_thumbnail(
     global_system_media_transport_controls_session_media_properties: &GlobalSystemMediaTransportControlsSessionMediaProperties,
 ) -> anyhow::Result<Thumbnail> {
-    let i_random_access_stream_with_content_type = global_system_media_transport_controls_session_media_properties
-        .Thumbnail()?
-        .OpenReadAsync()?
-        .await?;
+    let i_random_access_stream_with_content_type: windows::Storage::Streams::IRandomAccessStreamWithContentType =
+        global_system_media_transport_controls_session_media_properties
+            .Thumbnail()?
+            .OpenReadAsync()?
+            .await?;
     let mime_type = i_random_access_stream_with_content_type.ContentType()?.to_string_lossy();
-    let buffer = Buffer::Create(i_random_access_stream_with_content_type.Size()? as _)?;
-    i_random_access_stream_with_content_type.ReadAsync(&buffer, i_random_access_stream_with_content_type.Size()? as _, InputStreamOptions::None)?;
-    let i_buffer = buffer.into();
-    let bytes = i_buffer_info_bytes(&i_buffer)?.to_vec().into_boxed_slice();
+    let size = i_random_access_stream_with_content_type.Size()? as usize;
+    let i_input_stream = i_random_access_stream_with_content_type.GetInputStreamAt(0)?;
+    let data_reader = DataReader::CreateDataReader(&i_input_stream)?;
+    data_reader.LoadAsync(size as _)?.await?;
+    let mut bytes = vec![0; size].into_boxed_slice();
+    data_reader.ReadBytes(&mut bytes)?;
     Ok(Thumbnail { mime_type, bytes })
 }
 
@@ -212,6 +217,7 @@ async fn get_session_infos() -> anyhow::Result<Vec<SessionInfo>> {
         .GetSessions()
         .context("Can not get sessions")?
     {
+        tokio::time::sleep(Duration::new(0, 50_000_000)).await;
         for _ in 0..20 {
             let session_info_result = get_session_info(&global_system_media_transport_controls_session).await;
             match session_info_result {
@@ -228,7 +234,7 @@ async fn get_session_infos() -> anyhow::Result<Vec<SessionInfo>> {
     Ok(session_infos)
 }
 
-async fn run_notifer() -> anyhow::Result<()> {
+async fn command_run_notifer() -> anyhow::Result<()> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     let global_system_media_transport_controls_session_manager = GlobalSystemMediaTransportControlsSessionManager::RequestAsync()
         .context("Can not get global system media transport controls session manager")?
@@ -253,25 +259,48 @@ async fn run_notifer() -> anyhow::Result<()> {
             if session_info.source_app_user_mode_id.starts_with("MSTeams_") {
                 continue;
             }
-            let full_title = format!("{} – {}", &session_info.title, &session_info.subtitle);
-            send_toast(
-                Duration::new(4, 0),
-                &session_info.source_app_user_mode_id,
-                if session_info.subtitle.is_empty() { &session_info.title } else { &full_title },
-                &session_info.album_title,
-                &session_info.artist,
-                &session_info.thumbnail,
-            )
-            .await
-            .context("Failed to send toast")?;
+            let toast = Toast {
+                duration: Duration::new(3, 0),
+                source_app_user_mode_id: session_info.source_app_user_mode_id.clone(),
+                line_1: if session_info.subtitle.is_empty() {
+                    session_info.title.clone()
+                } else {
+                    format!("{} – {}", session_info.title, session_info.subtitle)
+                },
+                line_2: session_info.album_title.clone(),
+                line_3: session_info.artist.clone(),
+                thumbnail: session_info.thumbnail.clone(),
+            };
+            send_toast(toast).await.context("Failed to send toast")?;
         }
         prev_session_infos = session_infos;
     }
     Ok(())
 }
 
+#[derive(Debug, clap::Subcommand)]
+enum Command {
+    RunNotifier,
+    SendToast { toast_json_path: String },
+}
+
+#[derive(Debug, clap::Parser)]
+struct Cli {
+    #[clap(subcommand)]
+    command: Option<Command>,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    run_notifer().await.context("Notifier failed")?;
+    let cli = Cli::parse();
+    let command = cli.command.unwrap_or(Command::RunNotifier);
+    match command {
+        Command::RunNotifier => command_run_notifer().await.context("Run notifier failed")?,
+        Command::SendToast { toast_json_path } => {
+            let toast_json = String::from_utf8(fs::read(toast_json_path)?)?;
+            let toast = serde_json::from_str(&toast_json)?;
+            command_send_toast(toast).await.context("Send toast failed")?
+        }
+    }
     Ok(())
 }
