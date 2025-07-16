@@ -8,6 +8,7 @@ use std::{
     path::PathBuf,
     time::Duration,
 };
+use tokio::sync::mpsc::UnboundedSender;
 use windows::{
     Data::Xml::Dom::{XmlDocument, XmlElement},
     Foundation::TypedEventHandler,
@@ -207,7 +208,7 @@ async fn get_session_info(global_system_media_transport_controls_session: &Globa
     })
 }
 
-async fn get_session_infos() -> anyhow::Result<Vec<SessionInfo>> {
+async fn get_session_infos(update_tx: UnboundedSender<()>) -> anyhow::Result<Vec<SessionInfo>> {
     let mut session_infos = vec![];
     let global_system_media_transport_controls_session_manager = GlobalSystemMediaTransportControlsSessionManager::RequestAsync()
         .context("Can not get global system media transport controls session manager")?
@@ -217,6 +218,15 @@ async fn get_session_infos() -> anyhow::Result<Vec<SessionInfo>> {
         .GetSessions()
         .context("Can not get sessions")?
     {
+        global_system_media_transport_controls_session.MediaPropertiesChanged(&TypedEventHandler::new({
+            let update_tx = update_tx.clone();
+            move |_, _| {
+                update_tx
+                    .send(())
+                    .map_err(|e| windows_result::Error::from(std::io::Error::new(ErrorKind::BrokenPipe, e)))?;
+                Ok(())
+            }
+        }))?;
         tokio::time::sleep(Duration::new(0, 50_000_000)).await;
         for _ in 0..20 {
             let session_info_result = get_session_info(&global_system_media_transport_controls_session).await;
@@ -235,23 +245,24 @@ async fn get_session_infos() -> anyhow::Result<Vec<SessionInfo>> {
 }
 
 async fn command_run_notifer() -> anyhow::Result<()> {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let (update_tx, mut update_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     let global_system_media_transport_controls_session_manager = GlobalSystemMediaTransportControlsSessionManager::RequestAsync()
         .context("Can not get global system media transport controls session manager")?
         .await
         .context("Can not get global system media transport controls session manager")?;
     global_system_media_transport_controls_session_manager.SessionsChanged(&TypedEventHandler::new({
-        let tx = tx.clone();
+        let update_tx = update_tx.clone();
         move |_, _| {
-            tx.send(())
+            update_tx
+                .send(())
                 .map_err(|e| windows_result::Error::from(std::io::Error::new(ErrorKind::BrokenPipe, e)))?;
             Ok(())
         }
     }))?;
-    tx.send(())?;
+    update_tx.send(())?;
     let mut prev_session_infos = vec![];
-    while let Some(()) = rx.recv().await {
-        let session_infos = get_session_infos().await.context("Can not get session infos")?;
+    while let Some(()) = update_rx.recv().await {
+        let session_infos = get_session_infos(update_tx.clone()).await.context("Can not get session infos")?;
         for session_info in &session_infos {
             if prev_session_infos.contains(session_info) {
                 continue;
