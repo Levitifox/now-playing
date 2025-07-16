@@ -170,7 +170,6 @@ async fn get_session_info(global_system_media_transport_controls_session: &Globa
         .SourceAppUserModelId()
         .context("Can not get source app user model id")?
         .to_string_lossy();
-    tokio::time::sleep(Duration::new(2, 0)).await;
     let global_system_media_transport_controls_session_media_properties = global_system_media_transport_controls_session
         .TryGetMediaPropertiesAsync()
         .context("Can not get media properties")?
