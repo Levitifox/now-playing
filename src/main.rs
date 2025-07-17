@@ -1,3 +1,5 @@
+#![windows_subsystem = "windows"]
+
 use anyhow::{Context, anyhow, bail};
 use clap::Parser;
 use itertools::Itertools;
@@ -6,6 +8,7 @@ use std::{
     env, fs,
     io::{ErrorKind, Write},
     path::PathBuf,
+    thread,
     time::Duration,
 };
 use tokio::sync::mpsc::UnboundedSender;
@@ -18,6 +21,19 @@ use windows::{
     },
     Storage::Streams::DataReader,
     UI::Notifications::{ToastNotification, ToastNotificationManager, ToastTemplateType},
+    Win32::{
+        Foundation::{HWND, LPARAM, LRESULT, WPARAM},
+        System::LibraryLoader::GetModuleHandleA,
+        UI::{
+            Shell::{NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAA, Shell_NotifyIconA},
+            WindowsAndMessaging::{
+                AppendMenuA, CS_HREDRAW, CW_USEDEFAULT, CreatePopupMenu, CreateWindowExA, DefWindowProcA, DispatchMessageA, GWLP_USERDATA, GetCursorPos,
+                GetMessageA, GetWindowLongPtrA, HMENU, IDC_ARROW, IDI_APPLICATION, LoadCursorW, LoadIconW, MF_STRING, MSG, PostQuitMessage, RegisterClassA,
+                SetForegroundWindow, SetWindowLongPtrA, TPM_RIGHTBUTTON, TrackPopupMenu, WINDOW_EX_STYLE, WM_COMMAND, WM_DESTROY, WM_RBUTTONUP, WM_USER,
+                WNDCLASSA, WS_OVERLAPPEDWINDOW,
+            },
+        },
+    },
     core::Interface,
 };
 
@@ -208,7 +224,7 @@ async fn get_session_info(global_system_media_transport_controls_session: &Globa
     })
 }
 
-async fn get_session_infos(update_tx: UnboundedSender<()>) -> anyhow::Result<Vec<SessionInfo>> {
+async fn get_session_infos(event_tx: UnboundedSender<Event>) -> anyhow::Result<Vec<SessionInfo>> {
     let mut session_infos = vec![];
     let global_system_media_transport_controls_session_manager = GlobalSystemMediaTransportControlsSessionManager::RequestAsync()
         .context("Can not get global system media transport controls session manager")?
@@ -219,10 +235,10 @@ async fn get_session_infos(update_tx: UnboundedSender<()>) -> anyhow::Result<Vec
         .context("Can not get sessions")?
     {
         global_system_media_transport_controls_session.MediaPropertiesChanged(&TypedEventHandler::new({
-            let update_tx = update_tx.clone();
+            let event_tx = event_tx.clone();
             move |_, _| {
-                update_tx
-                    .send(())
+                event_tx
+                    .send(Event::Update)
                     .map_err(|e| windows_result::Error::from(std::io::Error::new(ErrorKind::BrokenPipe, e)))?;
                 Ok(())
             }
@@ -244,49 +260,182 @@ async fn get_session_infos(update_tx: UnboundedSender<()>) -> anyhow::Result<Vec
     Ok(session_infos)
 }
 
-async fn command_run_notifer() -> anyhow::Result<()> {
-    let (update_tx, mut update_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+#[derive(PartialEq, Eq, Debug)]
+enum Event {
+    Update,
+    Quit,
+}
+
+async fn command_run_notifer(
+    event_tx: tokio::sync::mpsc::UnboundedSender<Event>,
+    mut event_rx: tokio::sync::mpsc::UnboundedReceiver<Event>,
+) -> anyhow::Result<()> {
     let global_system_media_transport_controls_session_manager = GlobalSystemMediaTransportControlsSessionManager::RequestAsync()
         .context("Can not get global system media transport controls session manager")?
         .await
         .context("Can not get global system media transport controls session manager")?;
     global_system_media_transport_controls_session_manager.SessionsChanged(&TypedEventHandler::new({
-        let update_tx = update_tx.clone();
+        let event_tx = event_tx.clone();
         move |_, _| {
-            update_tx
-                .send(())
+            event_tx
+                .send(Event::Update)
                 .map_err(|e| windows_result::Error::from(std::io::Error::new(ErrorKind::BrokenPipe, e)))?;
             Ok(())
         }
     }))?;
-    update_tx.send(())?;
+    event_tx.send(Event::Update)?;
     let mut prev_session_infos = vec![];
-    while let Some(()) = update_rx.recv().await {
-        let session_infos = get_session_infos(update_tx.clone()).await.context("Can not get session infos")?;
-        for session_info in &session_infos {
-            if prev_session_infos.contains(session_info) {
-                continue;
+    while let Some(event) = event_rx.recv().await {
+        match event {
+            Event::Update => {
+                let session_infos = get_session_infos(event_tx.clone()).await.context("Can not get session infos")?;
+                for session_info in &session_infos {
+                    if prev_session_infos.contains(session_info) {
+                        continue;
+                    }
+                    if session_info.source_app_user_mode_id.starts_with("MSTeams_") {
+                        continue;
+                    }
+                    let toast = Toast {
+                        duration: Duration::new(3, 0),
+                        source_app_user_mode_id: session_info.source_app_user_mode_id.clone(),
+                        line_1: if session_info.subtitle.is_empty() {
+                            session_info.title.clone()
+                        } else {
+                            format!("{} – {}", session_info.title, session_info.subtitle)
+                        },
+                        line_2: session_info.album_title.clone(),
+                        line_3: session_info.artist.clone(),
+                        thumbnail: session_info.thumbnail.clone(),
+                    };
+                    send_toast(toast).await.context("Failed to send toast")?;
+                }
+                prev_session_infos = session_infos;
             }
-            if session_info.source_app_user_mode_id.starts_with("MSTeams_") {
-                continue;
-            }
-            let toast = Toast {
-                duration: Duration::new(3, 0),
-                source_app_user_mode_id: session_info.source_app_user_mode_id.clone(),
-                line_1: if session_info.subtitle.is_empty() {
-                    session_info.title.clone()
-                } else {
-                    format!("{} – {}", session_info.title, session_info.subtitle)
-                },
-                line_2: session_info.album_title.clone(),
-                line_3: session_info.artist.clone(),
-                thumbnail: session_info.thumbnail.clone(),
-            };
-            send_toast(toast).await.context("Failed to send toast")?;
+            Event::Quit => break,
         }
-        prev_session_infos = session_infos;
     }
     Ok(())
+}
+
+fn windows_thread(event_tx: tokio::sync::mpsc::UnboundedSender<Event>) -> anyhow::Result<()> {
+    const ID_TRAY_EXIT: usize = 1001;
+    const WM_TRAYICON: u32 = WM_USER + 1;
+
+    struct WndprocData {
+        nid: NOTIFYICONDATAA,
+        hmenu: HMENU,
+        event_tx: tokio::sync::mpsc::UnboundedSender<Event>,
+    }
+
+    extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        unsafe {
+            let wndproc_data_ptr = GetWindowLongPtrA(hwnd, GWLP_USERDATA) as *mut WndprocData;
+            let wndproc_data = if wndproc_data_ptr.is_null() { None } else { Some(&*wndproc_data_ptr) };
+
+            let aux = || -> anyhow::Result<LRESULT> {
+                match message {
+                    WM_TRAYICON => {
+                        if lparam.0 == WM_RBUTTONUP as isize {
+                            let mut pt = Default::default();
+                            GetCursorPos(&mut pt)?;
+                            if !SetForegroundWindow(hwnd).as_bool() {
+                                bail!("Unable to set foreground window")
+                            }
+                            if !TrackPopupMenu(wndproc_data.unwrap().hmenu, TPM_RIGHTBUTTON, pt.x, pt.y, None, hwnd, None).as_bool() {
+                                bail!("Unable to track popup menu")
+                            }
+                        }
+                        Ok(LRESULT(0))
+                    }
+                    WM_COMMAND => {
+                        if wparam.0 == ID_TRAY_EXIT {
+                            if !Shell_NotifyIconA(NIM_DELETE, &wndproc_data.unwrap().nid).as_bool() {
+                                bail!("Unable to notify icon")
+                            }
+                            PostQuitMessage(0);
+                            wndproc_data.unwrap().event_tx.send(Event::Quit)?;
+                        }
+                        Ok(LRESULT(0))
+                    }
+                    WM_DESTROY => {
+                        PostQuitMessage(0);
+                        wndproc_data.unwrap().event_tx.send(Event::Quit)?;
+                        Ok(LRESULT(0))
+                    }
+                    _ => Ok(DefWindowProcA(hwnd, message, wparam, lparam)),
+                }
+            };
+            aux().unwrap()
+        }
+    }
+
+    unsafe {
+        let instance = GetModuleHandleA(None)?;
+        let window_class = windows_strings::s!("now-playing");
+
+        let wc = WNDCLASSA {
+            hCursor: LoadCursorW(None, IDC_ARROW)?,
+            hInstance: instance.into(),
+            lpszClassName: window_class,
+            style: CS_HREDRAW,
+            lpfnWndProc: Some(wndproc),
+            ..Default::default()
+        };
+
+        let atom = RegisterClassA(&wc);
+        assert!(atom != 0);
+
+        let hwnd = CreateWindowExA(
+            WINDOW_EX_STYLE::default(),
+            window_class,
+            windows_strings::s!("Now playing"),
+            WS_OVERLAPPEDWINDOW,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            None,
+            None,
+            None,
+            None,
+        )?;
+
+        let hmenu = CreatePopupMenu()?;
+        AppendMenuA(hmenu, MF_STRING, ID_TRAY_EXIT, windows_strings::s!("Exit"))?;
+
+        let nid = NOTIFYICONDATAA {
+            cbSize: size_of::<NOTIFYICONDATAA>() as _,
+            hWnd: hwnd,
+            uID: 1,
+            uCallbackMessage: WM_TRAYICON,
+            uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
+            hIcon: LoadIconW(None, IDI_APPLICATION)?,
+            szTip: b"Now playing\0"
+                .iter()
+                .map(|&b| b as i8)
+                .chain(std::iter::repeat(0))
+                .take(128)
+                .collect::<Vec<_>>()
+                .try_into()
+                .unwrap(),
+            ..Default::default()
+        };
+
+        if !Shell_NotifyIconA(NIM_ADD, &nid).as_bool() {
+            bail!("Unable to add shell icon")
+        }
+
+        let wndproc_data = WndprocData { nid, hmenu, event_tx };
+        SetWindowLongPtrA(hwnd, GWLP_USERDATA, Box::leak(Box::new(wndproc_data)) as *mut _ as _);
+
+        let mut message = MSG::default();
+        while GetMessageA(&mut message, None, 0, 0).into() {
+            DispatchMessageA(&message);
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -306,7 +455,14 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let command = cli.command.unwrap_or(Command::RunNotifier);
     match command {
-        Command::RunNotifier => command_run_notifer().await.context("Run notifier failed")?,
+        Command::RunNotifier => {
+            let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+            thread::spawn({
+                let event_tx = event_tx.clone();
+                || windows_thread(event_tx)
+            });
+            command_run_notifer(event_tx, event_rx).await.context("Run notifier failed")?
+        }
         Command::SendToast { toast_json_path } => {
             let toast_json = String::from_utf8(fs::read(toast_json_path)?)?;
             let toast = serde_json::from_str(&toast_json)?;
