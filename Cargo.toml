@@ -2,6 +2,10 @@
 name = "now-playing"
 version = "0.1.0"
 edition = "2024"
+build = "build.rs"
+
+[build-dependencies]
+winres = "0.1.12"
 
 [dependencies]
 anyhow = "1.0.98"

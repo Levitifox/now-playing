@@ -28,9 +28,9 @@ use windows::{
             Shell::{NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAA, Shell_NotifyIconA},
             WindowsAndMessaging::{
                 AppendMenuA, CS_HREDRAW, CW_USEDEFAULT, CreatePopupMenu, CreateWindowExA, DefWindowProcA, DispatchMessageA, GWLP_USERDATA, GetCursorPos,
-                GetMessageA, GetWindowLongPtrA, HMENU, IDC_ARROW, IDI_APPLICATION, LoadCursorW, LoadIconW, MF_STRING, MSG, PostQuitMessage, RegisterClassA,
-                SetForegroundWindow, SetWindowLongPtrA, TPM_RIGHTBUTTON, TrackPopupMenu, WINDOW_EX_STYLE, WM_COMMAND, WM_DESTROY, WM_RBUTTONUP, WM_USER,
-                WNDCLASSA, WS_OVERLAPPEDWINDOW,
+                GetMessageA, GetWindowLongPtrA, HMENU, IDC_ARROW, LoadCursorW, LoadIconA, MF_STRING, MSG, PostQuitMessage, RegisterClassA, SetForegroundWindow,
+                SetWindowLongPtrA, TPM_RIGHTBUTTON, TrackPopupMenu, WINDOW_EX_STYLE, WM_COMMAND, WM_DESTROY, WM_RBUTTONUP, WM_USER, WNDCLASSA,
+                WS_OVERLAPPEDWINDOW,
             },
         },
     },
@@ -410,7 +410,7 @@ fn windows_thread(event_tx: tokio::sync::mpsc::UnboundedSender<Event>) -> anyhow
             uID: 1,
             uCallbackMessage: WM_TRAYICON,
             uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
-            hIcon: LoadIconW(None, IDI_APPLICATION)?,
+            hIcon: LoadIconA(Some(instance.into()), windows_strings::s!("IDI_MAIN_ICON"))?,
             szTip: b"Now playing\0"
                 .iter()
                 .map(|&b| b as i8)
