@@ -159,7 +159,7 @@ async fn send_toast(toast: Toast) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[derive(PartialEq, Eq, Debug)]
+#[derive(Debug)]
 struct SessionInfo {
     source_app_user_mode_id: String,
     title: String,
@@ -168,6 +168,18 @@ struct SessionInfo {
     album_title: String,
     thumbnail: Option<Thumbnail>,
 }
+
+impl PartialEq for SessionInfo {
+    fn eq(&self, other: &Self) -> bool {
+        self.source_app_user_mode_id == other.source_app_user_mode_id
+            && self.title == other.title
+            && self.subtitle == other.subtitle
+            && self.artist == other.artist
+            && self.album_title == other.album_title
+    }
+}
+
+impl Eq for SessionInfo {}
 
 async fn get_thumbnail(
     global_system_media_transport_controls_session_media_properties: &GlobalSystemMediaTransportControlsSessionMediaProperties,
