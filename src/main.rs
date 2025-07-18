@@ -1,7 +1,8 @@
-// #![windows_subsystem = "windows"]
+#![windows_subsystem = "windows"]
 
 use anyhow::{Context, anyhow, bail};
 use clap::Parser;
+use directories::ProjectDirs;
 use itertools::Itertools;
 use serde_derive::{Deserialize, Serialize};
 use std::{
@@ -10,7 +11,7 @@ use std::{
     ffi::CString,
     fs,
     io::{ErrorKind, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     rc::Rc,
     sync::{Arc, RwLock},
     thread,
@@ -281,19 +282,25 @@ async fn get_session_infos(event_tx: UnboundedSender<Event>) -> anyhow::Result<V
 #[derive(PartialEq, Eq, Debug)]
 enum Event {
     Update,
+    ConfigChanged,
     Quit,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 struct Config {
     sources: Vec<(String, bool)>,
 }
 
-async fn command_run_notifer(
+async fn command_run_notifer<P>(
+    config_path: P,
     config: Arc<RwLock<Config>>,
     event_tx: tokio::sync::mpsc::UnboundedSender<Event>,
     mut event_rx: tokio::sync::mpsc::UnboundedReceiver<Event>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    P: AsRef<Path>,
+{
+    let config_path = config_path.as_ref();
     let global_system_media_transport_controls_session_manager = GlobalSystemMediaTransportControlsSessionManager::RequestAsync()
         .context("Can not get global system media transport controls session manager")?
         .await
@@ -308,6 +315,7 @@ async fn command_run_notifer(
         }
     }))?;
     event_tx.send(Event::Update)?;
+    event_tx.send(Event::ConfigChanged)?;
     let mut prev_session_infos = vec![];
     while let Some(event) = event_rx.recv().await {
         match event {
@@ -322,6 +330,7 @@ async fn command_run_notifer(
                         match sources.iter().find(|(source, _)| source == &session_info.source_app_user_mode_id) {
                             None => {
                                 sources.push((session_info.source_app_user_mode_id.clone(), true));
+                                event_tx.send(Event::ConfigChanged)?;
                             }
                             Some((_, enabled)) => {
                                 if !*enabled {
@@ -345,6 +354,10 @@ async fn command_run_notifer(
                     send_toast(toast).await.context("Failed to send toast")?;
                 }
                 prev_session_infos = session_infos;
+            }
+            Event::ConfigChanged => {
+                fs::create_dir_all(config_path.parent().unwrap()).context("Failed to create config dir")?;
+                fs::write(config_path, serde_json::to_string_pretty(&*config.read().unwrap())?).context("Failed to write config")?;
             }
             Event::Quit => break,
         }
@@ -434,6 +447,7 @@ fn windows_thread(config: Arc<RwLock<Config>>, event_tx: tokio::sync::mpsc::Unbo
                             ID_TRAY_CLEAR_KNOWN => {
                                 let sources = &mut wndproc_data.unwrap().config.write().unwrap().sources;
                                 sources.clear();
+                                wndproc_data.unwrap().event_tx.send(Event::ConfigChanged)?;
                             }
                             j if j >= ID_TRAY_SOURCES_START => {
                                 let i = j - ID_TRAY_SOURCES_START;
@@ -441,6 +455,7 @@ fn windows_thread(config: Arc<RwLock<Config>>, event_tx: tokio::sync::mpsc::Unbo
                                 if let Some((_, enabled)) = sources.get_mut(i) {
                                     *enabled = !*enabled;
                                 }
+                                wndproc_data.unwrap().event_tx.send(Event::ConfigChanged)?;
                             }
                             _ => (),
                         }
@@ -549,7 +564,18 @@ async fn main() -> anyhow::Result<()> {
     let command = cli.command.unwrap_or(Command::RunNotifier);
     match command {
         Command::RunNotifier => {
-            let config = Arc::new(RwLock::new(Config { sources: vec![] }));
+            let config_path = ProjectDirs::from("xyz", "Levitifox", "Now Playing")
+                .ok_or(anyhow!("Unable to get config dir"))?
+                .config_dir()
+                .join("config.json");
+            let config = if let Ok(config_str) = fs::read_to_string(&config_path)
+                && let Ok(config) = serde_json::from_str::<Config>(&config_str)
+            {
+                config
+            } else {
+                Config { sources: vec![] }
+            };
+            let config = Arc::new(RwLock::new(config));
             let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
             thread::spawn({
                 let event_tx = event_tx.clone();
@@ -558,7 +584,9 @@ async fn main() -> anyhow::Result<()> {
                     move || windows_thread(config, event_tx)
                 }
             });
-            command_run_notifer(config.clone(), event_tx, event_rx).await.context("Run notifier failed")?
+            command_run_notifer(config_path, config.clone(), event_tx, event_rx)
+                .await
+                .context("Run notifier failed")?
         }
         Command::SendToast { toast_json_path } => {
             let toast_json = String::from_utf8(fs::read(toast_json_path)?)?;
