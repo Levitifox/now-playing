@@ -1,6 +1,6 @@
 1 RT_MANIFEST "app.manifest"
 
-VS_VERSION_INFO VERSIONINFO
+1 VERSIONINFO
  FILEVERSION 1,0,0,0
  PRODUCTVERSION 1,0,0,0
  BEGIN
@@ -9,9 +9,11 @@ VS_VERSION_INFO VERSIONINFO
      BLOCK "040904b0"
      BEGIN
        VALUE "CompanyName",      "Levitifox\0"
-       VALUE "FileDescription",  "Now playing\0"
+		   VALUE "LegalCopyright",   "© Levitifox. MIT.\0"
+       VALUE "FileDescription",  "Now Playing\0"
+       VALUE "ProductName",      "Now Playing\0"
+		   VALUE "FileDescription",  "Displays notifications for currently playing media\0"
        VALUE "FileVersion",      "1.0.0.0\0"
-       VALUE "ProductName",      "Now playing\0"
        VALUE "ProductVersion",   "1.0.0.0\0"
      END
    END

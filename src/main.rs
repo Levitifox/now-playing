@@ -401,7 +401,7 @@ fn windows_thread(event_tx: tokio::sync::mpsc::UnboundedSender<Event>) -> anyhow
         let hwnd = CreateWindowExA(
             WINDOW_EX_STYLE::default(),
             window_class,
-            windows_strings::s!("Now playing"),
+            windows_strings::s!("Now Playing"),
             WS_OVERLAPPEDWINDOW,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
