@@ -1,13 +1,18 @@
-#![windows_subsystem = "windows"]
+// #![windows_subsystem = "windows"]
 
 use anyhow::{Context, anyhow, bail};
 use clap::Parser;
 use itertools::Itertools;
 use serde_derive::{Deserialize, Serialize};
 use std::{
-    env, fs,
+    cell::Cell,
+    env,
+    ffi::CString,
+    fs,
     io::{ErrorKind, Write},
     path::PathBuf,
+    rc::Rc,
+    sync::{Arc, RwLock},
     thread,
     time::Duration,
 };
@@ -27,15 +32,16 @@ use windows::{
         UI::{
             Shell::{NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAA, Shell_NotifyIconA},
             WindowsAndMessaging::{
-                AppendMenuA, CS_HREDRAW, CW_USEDEFAULT, CreatePopupMenu, CreateWindowExA, DefWindowProcA, DispatchMessageA, GWLP_USERDATA, GetCursorPos,
-                GetMessageA, GetWindowLongPtrA, HMENU, IDC_ARROW, LoadCursorW, LoadIconA, MF_STRING, MSG, PostQuitMessage, RegisterClassA, SetForegroundWindow,
-                SetWindowLongPtrA, TPM_RIGHTBUTTON, TrackPopupMenu, WINDOW_EX_STYLE, WM_COMMAND, WM_DESTROY, WM_RBUTTONUP, WM_USER, WNDCLASSA,
-                WS_OVERLAPPEDWINDOW,
+                AppendMenuA, CS_HREDRAW, CW_USEDEFAULT, CreatePopupMenu, CreateWindowExA, DefWindowProcA, DeleteMenu, DispatchMessageA, GWLP_USERDATA,
+                GetCursorPos, GetMessageA, GetWindowLongPtrA, HMENU, IDC_ARROW, LoadCursorW, LoadIconA, MF_BYCOMMAND, MF_CHECKED, MF_SEPARATOR, MF_STRING,
+                MF_UNCHECKED, MSG, PostQuitMessage, RegisterClassA, SetForegroundWindow, SetWindowLongPtrA, TPM_RIGHTBUTTON, TrackPopupMenu, WINDOW_EX_STYLE,
+                WM_COMMAND, WM_DESTROY, WM_RBUTTONUP, WM_USER, WNDCLASSA, WS_OVERLAPPEDWINDOW,
             },
         },
     },
     core::Interface,
 };
+use windows_strings::PCSTR;
 
 fn create_temp_file_with_contents(prefix: &str, suffix: &str, contents: &[u8]) -> anyhow::Result<PathBuf> {
     let named_temp_file = tempfile::Builder::new().disable_cleanup(true).prefix(prefix).suffix(suffix).tempfile()?;
@@ -278,7 +284,13 @@ enum Event {
     Quit,
 }
 
+#[derive(Debug)]
+struct Config {
+    sources: Vec<(String, bool)>,
+}
+
 async fn command_run_notifer(
+    config: Arc<RwLock<Config>>,
     event_tx: tokio::sync::mpsc::UnboundedSender<Event>,
     mut event_rx: tokio::sync::mpsc::UnboundedReceiver<Event>,
 ) -> anyhow::Result<()> {
@@ -305,8 +317,18 @@ async fn command_run_notifer(
                     if prev_session_infos.contains(session_info) {
                         continue;
                     }
-                    if session_info.source_app_user_mode_id.starts_with("MSTeams_") {
-                        continue;
+                    {
+                        let sources = &mut config.write().unwrap().sources;
+                        match sources.iter().find(|(source, _)| source == &session_info.source_app_user_mode_id) {
+                            None => {
+                                sources.push((session_info.source_app_user_mode_id.clone(), true));
+                            }
+                            Some((_, enabled)) => {
+                                if !*enabled {
+                                    continue;
+                                }
+                            }
+                        }
                     }
                     let toast = Toast {
                         duration: Duration::new(3, 0),
@@ -330,14 +352,52 @@ async fn command_run_notifer(
     Ok(())
 }
 
-fn windows_thread(event_tx: tokio::sync::mpsc::UnboundedSender<Event>) -> anyhow::Result<()> {
+fn windows_thread(config: Arc<RwLock<Config>>, event_tx: tokio::sync::mpsc::UnboundedSender<Event>) -> anyhow::Result<()> {
     const ID_TRAY_EXIT: usize = 1001;
+    const ID_TRAY_CLEAR_KNOWN: usize = 1002;
+    const ID_TRAY_SEPARATOR: usize = 1003;
+    const ID_TRAY_SOURCES_START: usize = 1004;
     const WM_TRAYICON: u32 = WM_USER + 1;
 
+    let old_sources_count = Rc::new(Cell::<Option<usize>>::new(None));
+
+    let update_menu = {
+        let config = config.clone();
+        move |hmenu: HMENU| -> anyhow::Result<()> {
+            unsafe {
+                if let Some(old_sources_count) = old_sources_count.get() {
+                    for i in 0..old_sources_count {
+                        DeleteMenu(hmenu, (ID_TRAY_SOURCES_START + i) as _, MF_BYCOMMAND).context("Removing source item")?;
+                    }
+                    DeleteMenu(hmenu, ID_TRAY_SEPARATOR as _, MF_BYCOMMAND).context("Removing generic item")?;
+                    DeleteMenu(hmenu, ID_TRAY_CLEAR_KNOWN as _, MF_BYCOMMAND).context("Removing generic item")?;
+                    DeleteMenu(hmenu, ID_TRAY_EXIT as _, MF_BYCOMMAND).context("Removing generic item")?;
+                }
+                let sources = &config.read().unwrap().sources;
+                for (i, (source, enabled)) in sources.iter().enumerate() {
+                    AppendMenuA(
+                        hmenu,
+                        MF_STRING | (if *enabled { MF_CHECKED } else { MF_UNCHECKED }),
+                        ID_TRAY_SOURCES_START + i,
+                        PCSTR::from_raw(CString::new(&**source)?.as_ptr() as *const u8),
+                    )
+                    .context("Adding source item")?;
+                }
+                AppendMenuA(hmenu, MF_SEPARATOR, ID_TRAY_SEPARATOR, PCSTR::null()).context("Adding generic item")?;
+                AppendMenuA(hmenu, MF_STRING, ID_TRAY_CLEAR_KNOWN, windows_strings::s!("Clear known")).context("Adding generic item")?;
+                AppendMenuA(hmenu, MF_STRING, ID_TRAY_EXIT, windows_strings::s!("Exit")).context("Adding generic item")?;
+                old_sources_count.set(Some(sources.len()));
+            }
+            Ok(())
+        }
+    };
+
     struct WndprocData {
+        config: Arc<RwLock<Config>>,
         nid: NOTIFYICONDATAA,
         hmenu: HMENU,
         event_tx: tokio::sync::mpsc::UnboundedSender<Event>,
+        update_menu: Box<dyn Fn(HMENU) -> anyhow::Result<()>>,
     }
 
     extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -352,21 +412,37 @@ fn windows_thread(event_tx: tokio::sync::mpsc::UnboundedSender<Event>) -> anyhow
                             let mut pt = Default::default();
                             GetCursorPos(&mut pt)?;
                             if !SetForegroundWindow(hwnd).as_bool() {
-                                bail!("Unable to set foreground window")
-                            }
-                            if !TrackPopupMenu(wndproc_data.unwrap().hmenu, TPM_RIGHTBUTTON, pt.x, pt.y, None, hwnd, None).as_bool() {
-                                bail!("Unable to track popup menu")
+                                eprintln!("Unable to set foreground window")
+                            } else {
+                                (wndproc_data.unwrap().update_menu)(wndproc_data.unwrap().hmenu)?;
+                                if !TrackPopupMenu(wndproc_data.unwrap().hmenu, TPM_RIGHTBUTTON, pt.x, pt.y, None, hwnd, None).as_bool() {
+                                    eprintln!("Unable to track popup menu")
+                                }
                             }
                         }
                         Ok(LRESULT(0))
                     }
                     WM_COMMAND => {
-                        if wparam.0 == ID_TRAY_EXIT {
-                            if !Shell_NotifyIconA(NIM_DELETE, &wndproc_data.unwrap().nid).as_bool() {
-                                bail!("Unable to notify icon")
+                        match wparam.0 {
+                            ID_TRAY_EXIT => {
+                                if !Shell_NotifyIconA(NIM_DELETE, &wndproc_data.unwrap().nid).as_bool() {
+                                    bail!("Unable to notify icon")
+                                }
+                                PostQuitMessage(0);
+                                wndproc_data.unwrap().event_tx.send(Event::Quit)?;
                             }
-                            PostQuitMessage(0);
-                            wndproc_data.unwrap().event_tx.send(Event::Quit)?;
+                            ID_TRAY_CLEAR_KNOWN => {
+                                let sources = &mut wndproc_data.unwrap().config.write().unwrap().sources;
+                                sources.clear();
+                            }
+                            j if j >= ID_TRAY_SOURCES_START => {
+                                let i = j - ID_TRAY_SOURCES_START;
+                                let sources = &mut wndproc_data.unwrap().config.write().unwrap().sources;
+                                if let Some((_, enabled)) = sources.get_mut(i) {
+                                    *enabled = !*enabled;
+                                }
+                            }
+                            _ => (),
                         }
                         Ok(LRESULT(0))
                     }
@@ -414,7 +490,6 @@ fn windows_thread(event_tx: tokio::sync::mpsc::UnboundedSender<Event>) -> anyhow
         )?;
 
         let hmenu = CreatePopupMenu()?;
-        AppendMenuA(hmenu, MF_STRING, ID_TRAY_EXIT, windows_strings::s!("Exit"))?;
 
         let nid = NOTIFYICONDATAA {
             cbSize: size_of::<NOTIFYICONDATAA>() as _,
@@ -438,7 +513,13 @@ fn windows_thread(event_tx: tokio::sync::mpsc::UnboundedSender<Event>) -> anyhow
             bail!("Unable to add shell icon")
         }
 
-        let wndproc_data = WndprocData { nid, hmenu, event_tx };
+        let wndproc_data = WndprocData {
+            config: config.clone(),
+            nid,
+            hmenu,
+            event_tx,
+            update_menu: Box::new(update_menu),
+        };
         SetWindowLongPtrA(hwnd, GWLP_USERDATA, Box::leak(Box::new(wndproc_data)) as *mut _ as _);
 
         let mut message = MSG::default();
@@ -468,12 +549,16 @@ async fn main() -> anyhow::Result<()> {
     let command = cli.command.unwrap_or(Command::RunNotifier);
     match command {
         Command::RunNotifier => {
+            let config = Arc::new(RwLock::new(Config { sources: vec![] }));
             let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
             thread::spawn({
                 let event_tx = event_tx.clone();
-                || windows_thread(event_tx)
+                {
+                    let config = config.clone();
+                    move || windows_thread(config, event_tx)
+                }
             });
-            command_run_notifer(event_tx, event_rx).await.context("Run notifier failed")?
+            command_run_notifer(config.clone(), event_tx, event_rx).await.context("Run notifier failed")?
         }
         Command::SendToast { toast_json_path } => {
             let toast_json = String::from_utf8(fs::read(toast_json_path)?)?;
