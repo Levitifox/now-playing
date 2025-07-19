@@ -29,7 +29,7 @@ use windows::{
     UI::Notifications::{ToastNotification, ToastNotificationManager, ToastTemplateType},
     Win32::{
         Foundation::{HWND, LPARAM, LRESULT, WPARAM},
-        System::LibraryLoader::GetModuleHandleA,
+        System::LibraryLoader::{GetModuleHandleA, GetProcAddress, LoadLibraryA},
         UI::{
             Shell::{NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAA, Shell_NotifyIconA},
             WindowsAndMessaging::{
@@ -365,7 +365,32 @@ where
     Ok(())
 }
 
+#[repr(i32)]
+#[derive(Debug, Copy, Clone)]
+#[allow(unused)]
+enum PreferredAppMode {
+    Default = 0,
+    AllowDark = 1,
+    ForceDark = 2,
+    ForceLight = 3,
+    Max = 4,
+}
+
+type SetPreferredAppModeFn = unsafe extern "system" fn(PreferredAppMode) -> PreferredAppMode;
+
+fn enable_dark_mode() {
+    unsafe {
+        let uxtheme_hmodule = LoadLibraryA(windows_strings::s!("uxtheme.dll")).unwrap_or_default();
+        let set_preferred_app_mode: Option<SetPreferredAppModeFn> = std::mem::transmute(GetProcAddress(uxtheme_hmodule, PCSTR(135 as _)));
+        if let Some(set_preferred_app_mode) = set_preferred_app_mode {
+            set_preferred_app_mode(PreferredAppMode::AllowDark);
+        }
+    }
+}
+
 fn windows_thread(config: Arc<RwLock<Config>>, event_tx: tokio::sync::mpsc::UnboundedSender<Event>) -> anyhow::Result<()> {
+    enable_dark_mode();
+
     const ID_TRAY_EXIT: usize = 1001;
     const ID_TRAY_CLEAR_KNOWN: usize = 1002;
     const ID_TRAY_SEPARATOR: usize = 1003;
